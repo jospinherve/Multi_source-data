@@ -47,7 +47,7 @@ def main():
     df_visits = pd.read_csv(enriched_path, low_memory=False)
     
     # Filter target visits (Month 12, 24, 36, 48)
-    target_visits = ['V04', 'V06', 'V08', 'V10']
+    target_visits = ['V04', 'V06', 'V10']
     df_target = df_visits[df_visits['EVENT_ID'].isin(target_visits)].copy()
     
     # Merge imaging data with the patient's Clinical Subtype assigned at baseline
@@ -79,7 +79,8 @@ def main():
         df_merged['R2_SN_MEAN'] = df_merged[['Moyenne_SN_R', 'Moyenne_SN_L']].mean(axis=1)
         img_features.append('R2_SN_MEAN')
 
-    sns.set_theme(style="whitegrid", palette="muted")
+    sns.set_theme(style="whitegrid")
+    SUBTYPE_PALETTE = {1: "#2b6cb0", 2: "#dd6b20", 3: "#276749"} 
     
     results = []
     
@@ -93,7 +94,8 @@ def main():
             x='EVENT_ID', 
             y=feat, 
             hue='Clinical_Subtype', 
-            order=target_visits, 
+            order=target_visits,
+            palette=SUBTYPE_PALETTE, 
             showfliers=False
         )
         sns.stripplot(
@@ -103,13 +105,13 @@ def main():
             hue='Clinical_Subtype', 
             order=target_visits, 
             dodge=True, 
-            alpha=0.4, 
-            color='k', 
+            alpha=0.4,
+            palette=SUBTYPE_PALETTE, 
             legend=False
         )
         
         plt.title(f"External Validation: {feat} across future visits\n(Grouped by Baseline Clinical Subtype)")
-        plt.xlabel("Visit (V04=M12, V06=M24, V08=M36, V10=M48)")
+        plt.xlabel("Visit (V04=M12, V06=M24, V10=M48)")
         plt.ylabel(feat)
         plt.legend(title="Subtype")
         plt.tight_layout()
