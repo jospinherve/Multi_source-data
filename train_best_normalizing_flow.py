@@ -4,7 +4,7 @@ This script consumes the already computed SuStaIn outputs, selects the best
 feature scenario (subscores), and trains a GPU-friendly conditional Real NVP
 with ActNorm, invertible linear mixing, and FiLM-conditioned coupling layers.
 
-Outputs are written under outputs/flow_diagnostics/best_subscores_v3_ref_L16_H1300.
+Outputs are written under results/flow_diagnostics/best_subscores_v3_ref_L16_H1300.
 """
 
 from __future__ import annotations
@@ -33,6 +33,9 @@ from sklearn.preprocessing import QuantileTransformer, StandardScaler
 
 
 LOGGER = logging.getLogger("train_best_normalizing_flow")
+
+SCRIPT_ROOT = Path(__file__).resolve().parent
+WORKSPACE_ROOT = SCRIPT_ROOT.parent
 
 METADATA_COLUMNS = {
     "PATNO",
@@ -421,8 +424,8 @@ def score_features(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
 
 
 def prepare_dataset(data_root: Path, scenario: str, target_features: int) -> tuple[pd.DataFrame, list[str], pd.DataFrame]:
-    long_path = data_root / "outputs" / "sustain_results" / "05_extended_pipeline" / "consolidated" / "extended_consolidated_long.csv"
-    assign_path = data_root / "outputs" / "sustain_results" / "05_extended_pipeline" / "longitudinal" / f"extended_{scenario}_longitudinal_assignments.csv"
+    long_path = data_root / "results" / "sustain" / "consolidated" / "extended_consolidated_long.csv"
+    assign_path = data_root / "results" / "sustain" / "longitudinal" / f"extended_{scenario}_longitudinal_assignments.csv"
 
     header_cols = pd.read_csv(long_path, nrows=0).columns.tolist()
     candidate_columns = build_candidate_columns(header_cols)
@@ -803,8 +806,8 @@ def save_diagnostics(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the best conditional normalizing flow for PPMI subscores")
-    parser.add_argument("--config", default="/home_nfs/jospin/TFE/config.yaml", help="Project config file")
-    parser.add_argument("--data-root", default="/home_nfs/jospin/TFE/", help="Project root directory")
+    parser.add_argument("--config", default=WORKSPACE_ROOT / "config.yaml", help="Project config file")
+    parser.add_argument("--data-root", default=SCRIPT_ROOT, help="Article_Code root directory")
     parser.add_argument("--scenario", default="subscores", choices=["global_scores", "subscores"], help="Override the flow scenario")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--preprocessing", choices=["standard", "quantile"], default="standard", help="Feature preprocessing mode before flow training")
@@ -865,7 +868,7 @@ def main() -> int:
     conditions = build_condition_matrix(selected_df, config.target_subtypes)
     feature_values = selected_df[selected_features].to_numpy(dtype=np.float32)
 
-    output_dir = data_root / "outputs" / "flow_diagnostics" / f"best_{config.scenario}_{config.architecture_label}"
+    output_dir = data_root / "results" / "flow_diagnostics" / f"best_{config.scenario}_{config.architecture_label}"
     output_dir.mkdir(parents=True, exist_ok=True)
     selected_df.to_csv(output_dir / "selected_training_table.csv", index=False)
 
