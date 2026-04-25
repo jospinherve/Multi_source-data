@@ -10,16 +10,16 @@ from scipy.stats import kruskal
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Characterize baseline clinical subtypes using longitudinal imaging data")
     # By default, use the strictly validated merge file
-    parser.add_argument("--enriched-csv", default=ROOT / "Ressources" / "PPMI_Global_Enriched_Visits.csv")
+    parser.add_argument("--enriched-csv", default=ROOT.parent / "Ressources" / "PPMI_Global_Enriched_Visits.csv")
     # By default, use the canonical longitudinal assignments from the subscores pipeline (02) or extended (05)
     # We fallback to extended_pipeline if present, otherwise specify path via CLI
-    parser.add_argument("--assignments-csv", default=ROOT / "outputs" / "sustain_results" / "05_extended_pipeline" / "longitudinal" / "extended_subscores_longitudinal_assignments.csv")
-    parser.add_argument("--out-dir", default=ROOT / "outputs" / "imaging_longitudinal_validation")
+    parser.add_argument("--assignments-csv", default=ROOT / "results" / "sustain" / "longitudinal" / "extended_subscores_longitudinal_assignments.csv")
+    parser.add_argument("--out-dir", default=ROOT / "results" / "imaging_validation")
     return parser.parse_args()
 
 def main():
