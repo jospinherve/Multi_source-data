@@ -35,7 +35,7 @@ best_flow:
   architecture_label: "v4_L8_H256_stable"
   n_layers: 8
   hidden_units: 256
-  use_inv1x1: true
+  use_inv1x1: False
   use_film: true
   conditioning: "subtype_stage_age"
   target_features: 32

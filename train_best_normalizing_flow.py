@@ -84,7 +84,7 @@ class BestFlowConfig:
     architecture_label: str = "v4_ref_L8_H256"
     n_layers: int = 8
     hidden_units: int = 256
-    use_inv1x1: bool = True
+    use_inv1x1: bool = False
     use_film: bool = True
     conditioning: str = "subtype_stage_age"
     target_features: int = 32
@@ -216,18 +216,20 @@ class ActNorm(nn.Module):
             self.log_scale.data = -torch.log(std)
             self.initialized.fill_(True)
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def _clamped_log_scale(self) -> torch.Tensor:
+        # UN SEUL endroit pour le clamping — forward ET inverse l'utilisent
+        return torch.clamp(self.log_scale, min=-3.0, max=3.0)
+
+    def forward(self, x: torch.Tensor, cond=None):
         if not bool(self.initialized):
             self._initialize(x)
-        # ActNorm uses an additive shift then multiplicative scale.
-        clamped_log_scale = torch.clamp(self.log_scale, min=-5.0, max=5.0)
-        y = (x + self.bias) * torch.exp(clamped_log_scale)
-        return y, clamped_log_scale.sum().expand(x.shape[0])
+        ls = self._clamped_log_scale()
+        y = (x + self.bias) * torch.exp(ls)
+        return y, ls.sum().expand(x.shape[0])
 
-    def inverse(self, z: torch.Tensor, cond: torch.Tensor | None = None) -> torch.Tensor:
-        clamped_log_scale = torch.clamp(self.log_scale, min=-5.0, max=5.0)
-        return z * torch.exp(-clamped_log_scale) - self.bias
-
+    def inverse(self, z: torch.Tensor, cond=None) -> torch.Tensor:
+        ls = self._clamped_log_scale()  # même clamping !
+        return z * torch.exp(-ls) - self.bias
 # Cette classe implémente une transformation linéaire inversible avec une factorisation LU pour assurer l'inversibilité et la stabilité numérique. Elle est utilisée comme couche de mélange dans le flux normalisant conditionnel.
 class InvertibleLinearLU(nn.Module):
     def __init__(self, dim: int) -> None:
@@ -245,16 +247,27 @@ class InvertibleLinearLU(nn.Module):
         self.log_s = nn.Parameter(torch.log(torch.abs(s) + 1e-6))
         self.register_buffer("eye", torch.eye(dim))
 
+    
     def _weight(self) -> torch.Tensor:
-        safe_log_s = torch.clamp(self.log_s, min=-5.0, max=5.0)
-        lower = torch.clamp(self.l + self.eye, min=-10.0, max=10.0)
-        upper = torch.clamp(self.u + torch.diag(self.sign_s * torch.exp(safe_log_s)), min=-10.0, max=10.0)
-        return self.p @ lower @ upper
+        safe_log_s = torch.clamp(self.log_s, min=-2.0, max=2.0)  # exp(2)≈7 max
+        lower = torch.tril(self.l, diagonal=-1)
+        lower = lower / (torch.norm(lower, dim=1, keepdim=True).clamp(min=1.0))  # normaliser lignes
+        L = lower + self.eye
+        U = torch.triu(self.u, diagonal=1)
+        U = U / (torch.norm(U, dim=0, keepdim=True).clamp(min=1.0))  # normaliser colonnes
+        S = torch.diag(self.sign_s * torch.exp(safe_log_s))
+        W = self.p @ L @ (U + S)
+        
+        # Contrôle de norme spectrale : forcer sigma_max <= 1 + epsilon
+        sigma_max = torch.linalg.matrix_norm(W, ord=2).detach()
+        if sigma_max > 2.0:
+            W = W / (sigma_max / 2.0)
+        return W
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         weight = self._weight()
         y = x @ weight
-        safe_log_s = torch.clamp(self.log_s, min=-5.0, max=5.0)
+        safe_log_s = torch.clamp(self.log_s, min=-2.0, max=2.0)
         log_det = safe_log_s.sum().expand(x.shape[0])
         return y, log_det
 
@@ -330,6 +343,7 @@ class ConditionalRealNVP(nn.Module):
         return base.sum(dim=-1) + log_det
 
     def sample(self, n_samples: int, cond: torch.Tensor | None = None, device: torch.device | None = None) -> torch.Tensor:
+
         if device is None:
             device = next(self.parameters()).device
         attempts = ((1.0, 4.0), (0.5, 3.0), (0.25, 2.0))
@@ -367,7 +381,7 @@ def load_config(path: Path) -> BestFlowConfig:
             architecture_label=best_flow.get("architecture_label", "v3_ref_L16_H1300"),
             n_layers=int(best_flow.get("n_layers", 12)),
             hidden_units=int(best_flow.get("hidden_units", 768)),
-            use_inv1x1=bool(best_flow.get("use_inv1x1", True)),
+            use_inv1x1=bool(best_flow.get("use_inv1x1", False)),
             use_film=bool(best_flow.get("use_film", True)),
             conditioning=best_flow.get("conditioning", "subtype_stage_age"),
             target_features=int(best_flow.get("target_features", 32)),
@@ -539,42 +553,50 @@ def apply_clinical_bounds(generated: np.ndarray, selected_features: list[str], b
     return projected
 
 
-def build_generation_condition_batch(
-    selected_df: pd.DataFrame,
-    subtype: int,
-    batch_size: int,
-    device: torch.device,
-    seed: int,
-) -> torch.Tensor:
-    """Construit un batch de conditions réalistes pour la génération.
 
-    Les conditions stage/age sont échantillonnées parmi les patients du même
-    subtype afin d'éviter une condition artificielle constante (0, 0).
-    """
-    subtype_df = selected_df[selected_df["Subtype"].astype(int) == int(subtype + 1)]
-    if subtype_df.empty:
-        cond = torch.zeros(batch_size, 3, device=device)
-        cond[:, 0] = float(subtype)
-        return cond
-
-    subtype_cond = build_condition_matrix(subtype_df, int(subtype) + 1)
-    rng = np.random.default_rng(seed + subtype)
-    sample_idx = rng.choice(len(subtype_cond), size=batch_size, replace=True)
-    cond = torch.tensor(subtype_cond[sample_idx], dtype=torch.float32, device=device)
-    cond[:, 0] = float(subtype)
-    return cond
+@dataclass(frozen=True)
+class ConditionStats:
+    """Global normalization stats computed once on the full dataset."""
+    stage_mean: float
+    stage_std: float
+    age_mean: float
+    age_std: float
 
 
-def build_condition_matrix(df: pd.DataFrame, n_subtypes: int) -> np.ndarray:
+def compute_condition_stats(df: pd.DataFrame) -> ConditionStats:
+    stage = pd.to_numeric(df["Stage"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+    age = pd.to_numeric(df["AGE_AT_VISIT"], errors="coerce")
+    age = age.fillna(float(age.median())).to_numpy(dtype=np.float32)
+    return ConditionStats(
+        stage_mean=float(stage.mean()),
+        stage_std=float(stage.std() + 1e-6),
+        age_mean=float(age.mean()),
+        age_std=float(age.std() + 1e-6),
+    )
+
+
+def build_condition_matrix(
+    df: pd.DataFrame,
+    n_subtypes: int,
+    stats: ConditionStats | None = None,  # None = compute locally (legacy, à éviter)
+) -> np.ndarray:
     subtype = df["Subtype"].astype(int).to_numpy() - 1
     subtype = np.clip(subtype, 0, n_subtypes - 1)
     stage = pd.to_numeric(df["Stage"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-    age = pd.to_numeric(df["AGE_AT_VISIT"], errors="coerce").fillna(df["AGE_AT_VISIT"].median()).to_numpy(dtype=np.float32)
-    stage_norm = (stage - stage.mean()) / (stage.std() + 1e-6)
-    age_norm = (age - age.mean()) / (age.std() + 1e-6)
-    return np.column_stack([subtype.astype(np.float32), stage_norm, age_norm]).astype(np.float32)
+    age = pd.to_numeric(df["AGE_AT_VISIT"], errors="coerce")
+    age = age.fillna(float(df["AGE_AT_VISIT"].median())).to_numpy(dtype=np.float32)
 
+    if stats is not None:
+        stage_norm = (stage - stats.stage_mean) / stats.stage_std
+        age_norm = (age - stats.age_mean) / stats.age_std
+    else:
+        # Legacy path — local normalization, à ne plus utiliser en génération
+        stage_norm = (stage - stage.mean()) / (stage.std() + 1e-6)
+        age_norm = (age - age.mean()) / (age.std() + 1e-6)
 
+    return np.column_stack(
+        [subtype.astype(np.float32), stage_norm, age_norm]
+    ).astype(np.float32)
 def train_flow(
     features: np.ndarray,
     conditions: np.ndarray,
@@ -710,7 +732,144 @@ def train_flow(
 
     return model, history, preprocessor
 
+def generate_samples(
+    model: ConditionalRealNVP,
+    selected_df: pd.DataFrame,
+    selected_features: list[str],
+    preprocessor: object,
+    config: BestFlowConfig,
+    cond_stats: ConditionStats,
+    device: torch.device,
+    n_samples_per_subtype: int = 500,
+) -> pd.DataFrame | None:
+    clinical_bounds = build_clinical_bounds(selected_df, selected_features)
+    samples = []
+    model.eval()
+    rng = np.random.default_rng(config.seed)
 
+    with torch.no_grad():
+        for subtype_idx in range(config.target_subtypes):
+            subtype_label = subtype_idx + 1
+            subtype_df = selected_df[
+                selected_df["Subtype"].astype(int) == subtype_label
+            ]
+            if subtype_df.empty:
+                LOGGER.warning("No real data for subtype %d, skipping.", subtype_label)
+                continue
+
+            # Utiliser les stats GLOBALES — cohérent avec l'entraînement
+            stage_sub = pd.to_numeric(
+                subtype_df["Stage"], errors="coerce"
+            ).fillna(0.0).to_numpy(dtype=np.float32)
+            age_sub = pd.to_numeric(subtype_df["AGE_AT_VISIT"], errors="coerce")
+            age_sub = age_sub.fillna(float(age_sub.median())).to_numpy(dtype=np.float32)
+
+            idx = rng.choice(len(subtype_df), size=n_samples_per_subtype, replace=True)
+
+            stage_norm = (stage_sub[idx] - cond_stats.stage_mean) / cond_stats.stage_std
+            age_norm = (age_sub[idx] - cond_stats.age_mean) / cond_stats.age_std
+
+            cond = np.column_stack([
+                np.full(n_samples_per_subtype, float(subtype_idx)),
+                stage_norm,
+                age_norm,
+            ]).astype(np.float32)
+            cond_t = torch.tensor(cond, dtype=torch.float32, device=device)
+
+            generated = model.sample(
+                n_samples_per_subtype, cond=cond_t, device=device
+            ).cpu().numpy()
+
+            # Vérifier qualité avant inverse_transform
+            finite_ratio = float(np.isfinite(generated).all(axis=1).mean())
+            if finite_ratio < 0.9:
+                LOGGER.error(
+                    "Subtype %d: only %.1f%% fully-finite samples — model unstable.",
+                    subtype_label, finite_ratio * 100,
+                )
+                continue
+
+            generated = np.nan_to_num(generated, nan=0.0, posinf=10.0, neginf=-10.0)
+
+            try:
+                generated_orig = preprocessor.inverse_transform(generated)
+            except Exception as e:
+                LOGGER.error(
+                    "inverse_transform failed for subtype %d: %s", subtype_label, e
+                )
+                continue
+
+            violation_rate = _compute_violation_rate(
+                generated_orig, selected_features, clinical_bounds
+            )
+            if violation_rate > 0.05:
+                LOGGER.warning(
+                    "Subtype %d: %.1f%% of values violate clinical bounds before projection.",
+                    subtype_label, violation_rate * 100,
+                )
+
+            generated_orig = apply_clinical_bounds(
+                generated_orig, selected_features, clinical_bounds
+            )
+
+            frame = pd.DataFrame(generated_orig, columns=selected_features)
+            frame.insert(0, "Subtype", subtype_label)
+            samples.append(frame)
+            LOGGER.info(
+                "Subtype %d: generated %d samples OK (violation_rate=%.1f%%).",
+                subtype_label, n_samples_per_subtype, violation_rate * 100,
+            )
+
+    return pd.concat(samples, ignore_index=True) if samples else None
+
+
+def _compute_violation_rate(
+    generated: np.ndarray,
+    selected_features: list[str],
+    bounds: dict[str, tuple[float, float]],
+) -> float:
+    violations, total = 0, 0
+    for idx, col in enumerate(selected_features):
+        if col not in bounds:
+            continue
+        lo, hi = bounds[col]
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            continue
+        col_vals = generated[:, idx]
+        violations += int(np.sum((col_vals < lo) | (col_vals > hi)))
+        total += len(col_vals)
+    return violations / max(1, total)
+
+
+def check_roundtrip(
+    model: ConditionalRealNVP,
+    features: np.ndarray,
+    conditions: np.ndarray,
+    preprocessor: object,
+    device: torch.device,
+    n: int = 64,
+) -> float:
+    """Vérifie que inverse(forward(x)) ≈ x. Retourne l'erreur max."""
+    model.eval()
+    rng = np.random.default_rng(42)
+    idx = rng.choice(len(features), size=min(n, len(features)), replace=False)
+    x_sample = preprocessor.transform(features[idx])
+    x_t = torch.tensor(x_sample, dtype=torch.float32, device=device)
+    c_t = torch.tensor(conditions[idx], dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        z, _ = model.forward(x_t, c_t)
+        x_recon = model.inverse(z, c_t)
+
+    err = (x_t - x_recon).abs().max().item()
+    LOGGER.info("Roundtrip reconstruction error (max abs): %.6f", err)
+    if err > 0.01:
+        LOGGER.warning(
+            "Roundtrip error=%.4f > 0.01 — inversion is numerically unstable. "
+            "Generated samples will be unreliable.",
+            err,
+        )
+    return err
 def save_diagnostics(
     output_dir: Path,
     history: dict[str, list[float]],
@@ -721,6 +880,7 @@ def save_diagnostics(
     preprocessor: object,
     config: BestFlowConfig,
     device: torch.device,
+    cond_stats: ConditionStats,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -782,7 +942,7 @@ def save_diagnostics(
 
     real_x = selected_df[selected_features].to_numpy(dtype=np.float32)
     real_x_proc = preprocessor.transform(real_x)
-    cond_matrix = build_condition_matrix(selected_df, config.target_subtypes)
+    cond_matrix = build_condition_matrix(selected_df, config.target_subtypes, stats=cond_stats)
     with torch.no_grad():
         z_real, _ = model.forward(
             torch.tensor(real_x_proc, dtype=torch.float32, device=device),
@@ -848,73 +1008,7 @@ def save_diagnostics(
     fig.savefig(output_dir / "latent_real_vs_generated_pca.png", dpi=160)
     plt.close(fig)
 
-    samples = []
-    successful_subtypes = 0
-    model.eval()
-    clinical_bounds = build_clinical_bounds(selected_df, selected_features)  # 🔧 Calculer bounds réalistes
-    with torch.no_grad():
-        for subtype in range(config.target_subtypes):
-            cond = build_generation_condition_batch(selected_df, subtype, 16, device, config.seed)
-            generated = model.sample(16, cond=cond, device=device).cpu().numpy()
-            
-            # Guard: validate and clip samples before inverse_transform
-            if not np.isfinite(generated).all():
-                LOGGER.warning(
-                    "Non-finite values detected in generated samples for subtype %d. Clipping to ±1e6.",
-                    subtype + 1,
-                )
-                generated = np.clip(generated, -1e6, 1e6)
-            
-            # Check if any values are still problematic
-            if not np.isfinite(generated).all():
-                LOGGER.error(
-                    "Generated samples still contain non-finite values after clipping for subtype %d. "
-                    "Skipping sample-based diagnostics.",
-                    subtype + 1,
-                )
-                continue
-            
-            try:
-                generated = preprocessor.inverse_transform(generated)
-                generated = apply_clinical_bounds(generated, selected_features, clinical_bounds)  # 🔧 Appliquer bounds APRÈS inverse_transform
-            except ValueError as e:
-                LOGGER.error(
-                    "Failed to inverse_transform samples for subtype %d: %s. Skipping sample-based diagnostics.",
-                    subtype + 1,
-                    str(e),
-                )
-                continue
-            
-            frame = pd.DataFrame(generated, columns=selected_features)
-            frame.insert(0, "Subtype", subtype + 1)
-            frame.insert(0, "SampleID", np.arange(1, len(frame) + 1))
-            samples.append(frame)
-            successful_subtypes += 1
     
-    if samples:
-        generated_df = pd.concat(samples, ignore_index=True)
-        generated_df.to_csv(output_dir / "generated_samples_by_subtype.csv", index=False)
-        LOGGER.info(
-            "Generated sample diagnostics available for %d/%d subtypes.",
-            successful_subtypes,
-            config.target_subtypes,
-        )
-
-        real_stats = pd.DataFrame({
-            "feature": selected_features,
-            "real_mean": real_x.mean(axis=0),
-            "real_std": real_x.std(axis=0),
-            "gen_mean": generated_df[selected_features].to_numpy(dtype=np.float32).mean(axis=0),
-            "gen_std": generated_df[selected_features].to_numpy(dtype=np.float32).std(axis=0),
-        })
-        real_stats["abs_mean_gap"] = (real_stats["real_mean"] - real_stats["gen_mean"]).abs()
-        real_stats["abs_std_gap"] = (real_stats["real_std"] - real_stats["gen_std"]).abs()
-        real_stats.to_csv(output_dir / "sample_quality_stats.csv", index=False)
-    else:
-        LOGGER.warning(
-            "No valid generated samples produced. Skipping sample quality diagnostics. "
-            "Check model stability and loss convergence."
-        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -934,10 +1028,8 @@ def main() -> int:
     config_path = Path(args.config).expanduser().resolve()
     LOGGER.info("Loading config from: %s", config_path)
     config = load_config(config_path)
-    
-    # Use config.yaml scenario if not explicitly overridden via CLI
+
     scenario = args.scenario if args.scenario is not None else config.scenario
-    
     config = BestFlowConfig(
         scenario=scenario,
         architecture_label=config.architecture_label,
@@ -955,31 +1047,93 @@ def main() -> int:
     )
 
     set_global_seed(config.seed)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    selected_df, selected_features, scored_features = prepare_dataset(data_root, config.scenario, config.target_features)
 
+    selected_df, selected_features, scored_features = prepare_dataset(
+        data_root, config.scenario, config.target_features
+    )
     actual_subtypes = int(selected_df["Subtype"].max())
     config = replace(config, target_subtypes=actual_subtypes)
 
     LOGGER.info("Using device: %s", device)
-    LOGGER.info("Selected scenario: %s | Auto-detected Subtypes: %d", config.scenario, config.target_subtypes)
-    LOGGER.info("Selected architecture: %s", config.architecture_label)
-    LOGGER.info("Training with seed=%d | preprocessing=%s | layers=%d | hidden=%d", config.seed, config.preprocessing, config.n_layers, config.hidden_units)
+    LOGGER.info("Scenario: %s | Subtypes: %d", config.scenario, config.target_subtypes)
+    LOGGER.info("Architecture: %s | layers=%d | hidden=%d", config.architecture_label, config.n_layers, config.hidden_units)
+
+    # Calculer les stats globales UNE FOIS — utilisées partout
+    cond_stats = compute_condition_stats(selected_df)
+    LOGGER.info(
+        "Condition stats — stage: mean=%.3f std=%.3f | age: mean=%.3f std=%.3f",
+        cond_stats.stage_mean, cond_stats.stage_std,
+        cond_stats.age_mean, cond_stats.age_std,
+    )
 
     selected_df = add_dequantization_jitter(selected_df, selected_features)
-    conditions = build_condition_matrix(selected_df, config.target_subtypes)
+
+    # Toutes les conditions utilisent les stats globales dès maintenant
+    conditions = build_condition_matrix(selected_df, config.target_subtypes, stats=cond_stats)
     feature_values = selected_df[selected_features].to_numpy(dtype=np.float32)
 
     output_dir = data_root / "results" / "flow_diagnostics" / f"best_{config.scenario}_{config.architecture_label}"
     output_dir.mkdir(parents=True, exist_ok=True)
     selected_df.to_csv(output_dir / "selected_training_table.csv", index=False)
 
-    model, history, preprocessor = train_flow(feature_values, conditions, config, device, output_dir)
-    save_diagnostics(output_dir, history, selected_features, scored_features, selected_df, model, preprocessor, config, device)
+    
+    (output_dir / "condition_stats.json").write_text(
+        json.dumps({
+            "stage_mean": cond_stats.stage_mean,
+            "stage_std": cond_stats.stage_std,
+            "age_mean": cond_stats.age_mean,
+            "age_std": cond_stats.age_std,
+        }, indent=2),
+        encoding="utf-8",
+    )
 
-    LOGGER.info("Training completed successfully")
-    LOGGER.info("Outputs saved in %s", output_dir)
+    model, history, preprocessor = train_flow(
+        feature_values, conditions, config, device, output_dir
+    )
+
+    # Vérification de stabilité AVANT toute génération
+    roundtrip_err = check_roundtrip(
+        model, feature_values, conditions, preprocessor, device
+    )
+    if roundtrip_err > 0.1:
+        LOGGER.error(
+            "Roundtrip error=%.4f is too high. Generated samples will be unreliable. "
+            "Consider reducing n_layers or disabling use_inv1x1.",
+            roundtrip_err,
+        )
+
+    # Diagnostics visuels (courbes, PCA latente, feature scores)
+    save_diagnostics(
+        output_dir, history, selected_features, scored_features,
+        selected_df, model, preprocessor, config, device, cond_stats,
+    )
+
+    # Génération finale — nouvelle fonction, stats globales, 500 samples
+    generated_df = generate_samples(
+        model, selected_df, selected_features, preprocessor,
+        config, cond_stats, device, n_samples_per_subtype=500,
+    )
+    if generated_df is not None:
+        generated_df.to_csv(output_dir / "generated_samples_by_subtype.csv", index=False)
+        LOGGER.info("Generated %d samples saved.", len(generated_df))
+
+        # Statistiques comparatives réel vs généré
+        real_x = feature_values
+        real_stats_df = pd.DataFrame({
+            "feature": selected_features,
+            "real_mean": real_x.mean(axis=0),
+            "real_std": real_x.std(axis=0),
+            "gen_mean": generated_df[selected_features].to_numpy(dtype=np.float32).mean(axis=0),
+            "gen_std": generated_df[selected_features].to_numpy(dtype=np.float32).std(axis=0),
+        })
+        real_stats_df["abs_mean_gap"] = (real_stats_df["real_mean"] - real_stats_df["gen_mean"]).abs()
+        real_stats_df["abs_std_gap"] = (real_stats_df["real_std"] - real_stats_df["gen_std"]).abs()
+        real_stats_df.to_csv(output_dir / "sample_quality_stats.csv", index=False)
+    else:
+        LOGGER.error("Generation failed entirely. Check roundtrip_err and model stability.")
+
+    LOGGER.info("Training completed. Outputs in %s", output_dir)
     return 0
 
 
