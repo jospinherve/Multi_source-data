@@ -1,0 +1,107 @@
+# Configuration for Personalised Progression Trajectories Project
+
+# SUSTAIN Phase Configuration
+sustain:
+  n_subtypes: 4  # Number of disease progression subtypes to identify
+  n_iterations: 50
+  n_samples: 100  # Bootstrap samples
+  biomarkers: null  # Will be loaded from data
+  exclude_biomarkers: []
+  random_seed: 42
+
+# Normalizing Flow Configuration
+flows:
+  architecture: "coupling"  # Options: "coupling", "glow", "real_nvp"
+  n_blocks: 4
+  hidden_units: 128
+  n_layers: 3
+  activation: "elu"
+  batch_norm: false
+  
+  # Training
+  learning_rate: 0.001
+  batch_size: 32
+  n_epochs: 200
+  weight_decay: 1.0e-5
+  early_stopping_patience: 20
+  
+  # Conditioning
+  condition_dim: null  # Will be set based on number of subtypes
+  condition_encoding: "embedding"  # Options: "embedding", "concatenation"
+
+# Best flow setup selected from the exploration phase
+best_flow:
+  scenario: "subscores"
+  architecture_label: "v4_L8_H256_stable"
+  n_layers: 8
+  hidden_units: 256
+  use_inv1x1: true
+  use_film: true
+  conditioning: "subtype_stage_age"
+  target_features: 32
+  target_subtypes: 2
+
+# Latent Space Optimisation
+latent_optimisation:
+  method: "gradient_ascent"
+  learning_rate: 0.01
+  n_iterations: 100
+  objective: "likelihood"  # Options: "likelihood", "clinical_score"
+
+# Data Configuration
+data:
+  dataset_path: "Ressources/"
+  train_test_split: 0.8
+  validation_split: 0.2
+  normalize: true
+  normalization_method: "standard"  # Options: "standard", "minmax", "robust"
+  handle_missing: "forward_fill"
+  
+  # Biomarker selection
+  baseline_timepoint: "BL"
+  followup_timepoint: "12M"
+
+# Clinical Constraints
+constraints:
+  # Monotonicity constraints (true = decreasing, false = increasing)
+  monotonic_decreasing:
+    - "UPDRS"
+    - "MoCA_decline"
+  
+  monotonic_increasing:
+    - "striatal_dopamine_loss"
+  
+  # Value bounds [min, max]
+  bounds:
+    "MoCA": [0, 30]
+    "UPDRS": [0, 132]
+    "CSF_alpha_synuclein": [0, null]
+
+# Validation Configuration
+validation:
+  comparison_models:
+    - "linear_mixed_models"
+    - "gaussian_processes"
+  
+  metrics:
+    - "likelihood"
+    - "clinical_coherence"
+    - "monotonicity_adherence"
+    - "uncertainty_calibration"
+  
+  test_set_size: 0.2
+
+# Output Configuration
+output:
+  results_dir: "outputs/results/"
+  models_dir: "outputs/models/"
+  figures_dir: "outputs/figures/"
+  save_plots: true
+  plot_format: "pdf"  # Options: "pdf", "png", "svg"
+  verbose: true
+
+# Random Seeds
+random_seeds:
+  torch: 42
+  numpy: 42
+  sklearn: 42

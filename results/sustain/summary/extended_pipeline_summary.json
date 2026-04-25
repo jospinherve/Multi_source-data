@@ -1,0 +1,16 @@
+{
+  "files_generated": [
+    "extended_consolidated_long.csv",
+    "extended_consolidated_wide.csv",
+    "extended_ppmi_visit_workbook.xlsx",
+    "extended_imaging_eligible_patients.csv",
+    "extended_baseline_clustering_comparison.csv",
+    "extended_sustain_methodology_results.csv",
+    "extended_longitudinal_stability.csv"
+  ],
+  "notes": [
+    "V04 is used as baseline reference for clustering comparison.",
+    "QUIP variables are integrated from QUIP-Current-Short_13Mar2026.csv (with QUIP_ANY_ICD used in core feature sets).",
+    "Longitudinal SuStaIn z-score runs are restricted to patients with >=2 visits among V04/V06/V08 and available data."
+  ]
+}

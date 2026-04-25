@@ -1,0 +1,4 @@
+scenario,n_patients,n_features_used,best_n_subtypes,best_loglikelihood,best_bic
+global_scores,798,8,8,82726.99220062967,-148087.1841564873
+subscores,798,32,3,302694.8559800107,-510116.20757758204
+augmented_with_imaging,358,32,3,124265.34231355504,-164686.0453070089
