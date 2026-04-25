@@ -81,7 +81,7 @@ SUBSCORE_PREFIXES = (
 @dataclass(frozen=True)
 class BestFlowConfig:
     scenario: str = "subscores"
-    architecture_label: str = "v4_ref_L16_H1300"
+    architecture_label: str = "v4_ref_L8_H256"
     n_layers: int = 8
     hidden_units: int = 256
     use_inv1x1: bool = True
@@ -516,16 +516,53 @@ def build_clinical_bounds(df_real: pd.DataFrame, selected_features: list[str]) -
 
 
 def apply_clinical_bounds(generated: np.ndarray, selected_features: list[str], bounds: dict[str, tuple[float, float]]) -> np.ndarray:
-    """Applique les bounds cliniques aux samples générés (après inverse_transform).
-    
-    Cela évite les samples aberrants produits par le flow model.
+    """Projette les samples générés dans une zone clinique plausible.
+
+    On évite un clipping dur systématique, car il peut écraser toute la variance
+    quand le modèle sort trop loin de la distribution réelle. La projection
+    souple garde l'ordre relatif des samples tout en restant bornée.
     """
-    clipped = generated.copy()
+    projected = generated.copy()
     for idx, col in enumerate(selected_features):
-        if col in bounds:
-            min_val, max_val = bounds[col]
-            clipped[:, idx] = np.clip(clipped[:, idx], min_val, max_val)
-    return clipped
+        if col not in bounds:
+            continue
+        min_val, max_val = bounds[col]
+        if not np.isfinite(min_val) or not np.isfinite(max_val) or max_val <= min_val:
+            continue
+
+        center = 0.5 * (min_val + max_val)
+        half_range = max(1e-6, 0.5 * (max_val - min_val))
+        normalized = (projected[:, idx] - center) / half_range
+        projected[:, idx] = center + half_range * np.tanh(normalized)
+        projected[:, idx] = np.clip(projected[:, idx], min_val, max_val)
+
+    return projected
+
+
+def build_generation_condition_batch(
+    selected_df: pd.DataFrame,
+    subtype: int,
+    batch_size: int,
+    device: torch.device,
+    seed: int,
+) -> torch.Tensor:
+    """Construit un batch de conditions réalistes pour la génération.
+
+    Les conditions stage/age sont échantillonnées parmi les patients du même
+    subtype afin d'éviter une condition artificielle constante (0, 0).
+    """
+    subtype_df = selected_df[selected_df["Subtype"].astype(int) == int(subtype + 1)]
+    if subtype_df.empty:
+        cond = torch.zeros(batch_size, 3, device=device)
+        cond[:, 0] = float(subtype)
+        return cond
+
+    subtype_cond = build_condition_matrix(subtype_df, int(subtype) + 1)
+    rng = np.random.default_rng(seed + subtype)
+    sample_idx = rng.choice(len(subtype_cond), size=batch_size, replace=True)
+    cond = torch.tensor(subtype_cond[sample_idx], dtype=torch.float32, device=device)
+    cond[:, 0] = float(subtype)
+    return cond
 
 
 def build_condition_matrix(df: pd.DataFrame, n_subtypes: int) -> np.ndarray:
@@ -817,8 +854,7 @@ def save_diagnostics(
     clinical_bounds = build_clinical_bounds(selected_df, selected_features)  # 🔧 Calculer bounds réalistes
     with torch.no_grad():
         for subtype in range(config.target_subtypes):
-            cond = torch.zeros(16, 3, device=device)
-            cond[:, 0] = float(subtype)
+            cond = build_generation_condition_batch(selected_df, subtype, 16, device, config.seed)
             generated = model.sample(16, cond=cond, device=device).cpu().numpy()
             
             # Guard: validate and clip samples before inverse_transform
