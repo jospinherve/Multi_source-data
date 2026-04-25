@@ -39,7 +39,7 @@ best_flow:
   use_film: true
   conditioning: "subtype_stage_age"
   target_features: 32
-  target_subtypes: 2
+  target_subtypes: 3
 
 # Latent Space Optimisation
 latent_optimisation:
@@ -50,7 +50,7 @@ latent_optimisation:
 
 # Data Configuration
 data:
-  dataset_path: "Ressources/"
+  dataset_path: "../Ressources/"
   train_test_split: 0.8
   validation_split: 0.2
   normalize: true
@@ -93,9 +93,9 @@ validation:
 
 # Output Configuration
 output:
-  results_dir: "outputs/results/"
-  models_dir: "outputs/models/"
-  figures_dir: "outputs/figures/"
+  results_dir: "results/"
+  models_dir: "results/flow_diagnostics/"
+  figures_dir: "results/figures/"
   save_plots: true
   plot_format: "pdf"  # Options: "pdf", "png", "svg"
   verbose: true

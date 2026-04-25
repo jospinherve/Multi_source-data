@@ -4,7 +4,7 @@ This script consumes the already computed SuStaIn outputs, selects the best
 feature scenario (subscores), and trains a GPU-friendly conditional Real NVP
 with ActNorm, invertible linear mixing, and FiLM-conditioned coupling layers.
 
-Outputs are written under results/flow_diagnostics/best_subscores_v3_ref_L16_H1300.
+.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch.optim.lr_scheduler import LambdaLR
 from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
 from sklearn.model_selection import train_test_split
 from sklearn.decomposition import PCA
@@ -81,9 +81,9 @@ SUBSCORE_PREFIXES = (
 @dataclass(frozen=True)
 class BestFlowConfig:
     scenario: str = "subscores"
-    architecture_label: str = "v3_ref_L16_H1300"
-    n_layers: int = 12
-    hidden_units: int = 768
+    architecture_label: str = "v4_ref_L16_H1300"
+    n_layers: int = 8
+    hidden_units: int = 256
     use_inv1x1: bool = True
     use_film: bool = True
     conditioning: str = "subtype_stage_age"
@@ -353,11 +353,15 @@ class ConditionalRealNVP(nn.Module):
 
 
 def load_config(path: Path) -> BestFlowConfig:
+    if not path.exists():
+        LOGGER.warning("Config file not found at %s. Falling back to built-in defaults.", path)
+        return BestFlowConfig()
+
     try:
-        import yaml
+        import yaml  # pyright: ignore[reportMissingModuleSource]
 
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        best_flow = data.get("best_flow", {})
+        best_flow = data.get("best_flow", {}) if isinstance(data, dict) else {}
         return BestFlowConfig(
             scenario=best_flow.get("scenario", "subscores"),
             architecture_label=best_flow.get("architecture_label", "v3_ref_L16_H1300"),
@@ -373,7 +377,12 @@ def load_config(path: Path) -> BestFlowConfig:
             preprocessing=str(best_flow.get("preprocessing", "standard")),
             seed=int(best_flow.get("seed", 42)),
         )
-    except Exception:
+    except Exception as exc:
+        LOGGER.warning(
+            "Failed to parse config file at %s (%s). Falling back to built-in defaults.",
+            path,
+            exc,
+        )
         return BestFlowConfig()
 
 
@@ -447,10 +456,29 @@ def prepare_dataset(data_root: Path, scenario: str, target_features: int) -> tup
     selected_df = merged[["PATNO", "VISIT", "Subtype", "Stage", "AGE_AT_VISIT"] + selected].copy()
     return selected_df, selected, scored
 
+def remap_sentinel_values(frame: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+    """Remplace les sentinelles codage (101, 999, etc.) par NaN pour éviter la gonflement du StandardScaler.
+    
+    Les sentinelles sont généralement des codes manquants dans les échelles PPMI.
+    Les remapper à NaN permet à fillna/median de les gérer correctement.
+    """
+    SENTINELS = (101, 999, 888, 777)
+    output = frame.copy()
+    for col in feature_cols:
+        series = pd.to_numeric(output[col], errors="coerce")
+        if series.dropna().empty:
+            continue
+        # Remplacer les sentinelles par NaN
+        for sentinel in SENTINELS:
+            series = series.mask(np.isclose(series, sentinel, atol=0.5), np.nan)
+        output[col] = series
+    return output
+
+
 # cette fonction ajoute un petit bruit gaussien aux caractéristiques sélectionnées pour éviter les problèmes de quantification et améliorer la stabilité du flux normalisant lors de l'entraînement. Elle vérifie d'abord si les valeurs sont essentiellement entières, et si c'est le cas, elle ajoute un bruit normal de petite amplitude. Sinon, elle laisse les valeurs telles quelles.
 def add_dequantization_jitter(frame: pd.DataFrame, feature_cols: list[str], seed: int = 42) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
-    output = frame.copy()
+    output = remap_sentinel_values(frame, feature_cols)  # 🔧 Remapper sentinelles AVANT jitter
     for col in feature_cols:
         series = pd.to_numeric(output[col], errors="coerce")
         if series.dropna().empty:
@@ -461,6 +489,43 @@ def add_dequantization_jitter(frame: pd.DataFrame, feature_cols: list[str], seed
         else:
             output[col] = filled
     return output
+
+
+def build_clinical_bounds(df_real: pd.DataFrame, selected_features: list[str]) -> dict[str, tuple[float, float]]:
+    """Construit des bounds cliniques réalistes basés sur les données réelles.
+    
+    Stratégie: 
+    - Pour chaque feature, calculer (min, max) valides (excluant NaN et extrema proches des sentinelles)
+    - Élargir les bounds de ±2.5% pour laisser un peu de marge aux samples générés
+    """
+    bounds = {}
+    for col in selected_features:
+        series = pd.to_numeric(df_real[col], errors="coerce")
+        valid = series.dropna()
+        if len(valid) == 0:
+            bounds[col] = (-np.inf, np.inf)
+            continue
+        # Exclure les valeurs qui pourraient être des sentinelles mal-remappées
+        q1, q99 = valid.quantile([0.01, 0.99])
+        min_val = float(valid[valid >= q1].min())
+        max_val = float(valid[valid <= q99].max())
+        # Élargir de ±2.5% pour robustesse
+        margin = (max_val - min_val) * 0.025
+        bounds[col] = (min_val - margin, max_val + margin)
+    return bounds
+
+
+def apply_clinical_bounds(generated: np.ndarray, selected_features: list[str], bounds: dict[str, tuple[float, float]]) -> np.ndarray:
+    """Applique les bounds cliniques aux samples générés (après inverse_transform).
+    
+    Cela évite les samples aberrants produits par le flow model.
+    """
+    clipped = generated.copy()
+    for idx, col in enumerate(selected_features):
+        if col in bounds:
+            min_val, max_val = bounds[col]
+            clipped[:, idx] = np.clip(clipped[:, idx], min_val, max_val)
+    return clipped
 
 
 def build_condition_matrix(df: pd.DataFrame, n_subtypes: int) -> np.ndarray:
@@ -521,12 +586,22 @@ def train_flow(
         cond_hidden_dim=config.cond_hidden_dim,
     ).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-5)
+    base_lr = 3e-4
+    optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-5)
     max_epochs = 200
     warmup_epochs = 10
-    scheduler1 = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
-    scheduler2 = CosineAnnealingLR(optimizer, T_max=max_epochs - warmup_epochs, eta_min=1e-6)
-    scheduler = SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_epochs])
+    min_lr_ratio = 1e-6 / base_lr
+
+    def lr_lambda(current_epoch: int) -> float:
+        if current_epoch < warmup_epochs:
+            warmup_progress = (current_epoch + 1) / max(1, warmup_epochs)
+            return 0.1 + 0.9 * warmup_progress
+        cosine_total = max(1, max_epochs - warmup_epochs)
+        cosine_epoch = min(current_epoch - warmup_epochs, cosine_total)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * cosine_epoch / cosine_total))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     best_val = float("inf")
     best_state = None
@@ -739,6 +814,7 @@ def save_diagnostics(
     samples = []
     successful_subtypes = 0
     model.eval()
+    clinical_bounds = build_clinical_bounds(selected_df, selected_features)  # 🔧 Calculer bounds réalistes
     with torch.no_grad():
         for subtype in range(config.target_subtypes):
             cond = torch.zeros(16, 3, device=device)
@@ -764,6 +840,7 @@ def save_diagnostics(
             
             try:
                 generated = preprocessor.inverse_transform(generated)
+                generated = apply_clinical_bounds(generated, selected_features, clinical_bounds)  # 🔧 Appliquer bounds APRÈS inverse_transform
             except ValueError as e:
                 LOGGER.error(
                     "Failed to inverse_transform samples for subtype %d: %s. Skipping sample-based diagnostics.",
@@ -806,9 +883,9 @@ def save_diagnostics(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the best conditional normalizing flow for PPMI subscores")
-    parser.add_argument("--config", default=WORKSPACE_ROOT / "config.yaml", help="Project config file")
+    parser.add_argument("--config", default="/home_nfs/jospin/TFE/Article_Code/config.yaml", help="Project config file")
     parser.add_argument("--data-root", default=SCRIPT_ROOT, help="Article_Code root directory")
-    parser.add_argument("--scenario", default="subscores", choices=["global_scores", "subscores"], help="Override the flow scenario")
+    parser.add_argument("--scenario", default=None, choices=["global_scores", "subscores"], help="Override the flow scenario (if None, uses config.yaml value)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--preprocessing", choices=["standard", "quantile"], default="standard", help="Feature preprocessing mode before flow training")
     return parser.parse_args()
@@ -818,9 +895,15 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     args = parse_args()
     data_root = Path(args.data_root).resolve()
-    config = load_config(Path(args.config))
+    config_path = Path(args.config).expanduser().resolve()
+    LOGGER.info("Loading config from: %s", config_path)
+    config = load_config(config_path)
+    
+    # Use config.yaml scenario if not explicitly overridden via CLI
+    scenario = args.scenario if args.scenario is not None else config.scenario
+    
     config = BestFlowConfig(
-        scenario=config.scenario,
+        scenario=scenario,
         architecture_label=config.architecture_label,
         n_layers=config.n_layers,
         hidden_units=config.hidden_units,
@@ -834,22 +917,6 @@ def main() -> int:
         preprocessing=args.preprocessing,
         seed=args.seed,
     )
-    if args.scenario is not None:
-        config = BestFlowConfig(
-            scenario=args.scenario,
-            architecture_label=config.architecture_label,
-            n_layers=max(8, config.n_layers - 2),
-            hidden_units=max(384, int(config.hidden_units * 0.75)),
-            use_inv1x1=config.use_inv1x1,
-            use_film=config.use_film,
-            conditioning=config.conditioning,
-            target_features=8 if args.scenario == "global_scores" else 32,
-            target_subtypes=config.target_subtypes, # Sera écrasé dynamiquement de toute façon
-            cond_embedding_dim=config.cond_embedding_dim,
-            cond_hidden_dim=config.cond_hidden_dim,
-            preprocessing=config.preprocessing,
-            seed=config.seed,
-        )
 
     set_global_seed(config.seed)
 
